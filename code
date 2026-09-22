@@ -1,0 +1,444 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 1. ROOT RAISED COSINE FILTER
+# ============================================================
+
+def rrc_filter(beta, span, sps):
+    """
+    Generate a Root Raised Cosine (RRC) filter.
+
+    beta : Roll-off factor
+    span : Filter span in symbols
+    sps  : Samples per symbol
+    """
+
+    N = span * sps
+    t = np.arange(-N/2, N/2 + 1) / sps
+
+    h = np.zeros_like(t, dtype=float)
+
+    for i, ti in enumerate(t):
+
+        if abs(ti) < 1e-12:
+            h[i] = 1 + beta * (4/np.pi - 1)
+
+        elif beta > 0 and abs(abs(ti) - 1/(4*beta)) < 1e-12:
+            h[i] = (
+                beta / np.sqrt(2)
+                * (
+                    (1 + 2/np.pi) * np.sin(np.pi/(4*beta))
+                    + (1 - 2/np.pi) * np.cos(np.pi/(4*beta))
+                )
+            )
+
+        else:
+            numerator = (
+                np.sin(np.pi * ti * (1-beta))
+                + 4 * beta * ti * np.cos(np.pi * ti * (1+beta))
+            )
+
+            denominator = (
+                np.pi * ti * (1 - (4*beta*ti)**2)
+            )
+
+            h[i] = numerator / denominator
+
+    # Normalize filter energy
+    h = h / np.sqrt(np.sum(h**2))
+
+    return h
+
+
+# ============================================================
+# 2. REUSABLE EYE-DIAGRAM FUNCTION
+# ============================================================
+
+def eye_diagram(signal, sps, samples_per_trace=2,
+                num_traces=100, title="Eye Diagram"):
+
+    """
+    Generate an eye diagram without communication toolbox.
+
+    signal            : Input waveform
+    sps               : Samples per symbol
+    samples_per_trace: Number of symbol periods per trace
+    num_traces        : Number of traces
+    """
+
+    trace_length = samples_per_trace * sps
+
+    total_length = trace_length + sps
+
+    traces = []
+
+    for i in range(num_traces):
+
+        start = i * sps
+
+        end = start + total_length
+
+        if end <= len(signal):
+            traces.append(signal[start:end])
+
+    traces = np.array(traces)
+
+    time_axis = np.arange(total_length) / sps
+
+    plt.figure(figsize=(8, 5))
+
+    for trace in traces:
+        plt.plot(time_axis, trace, alpha=0.25)
+
+    plt.axvline(1, linestyle='--', linewidth=1)
+
+    plt.title(title)
+
+    plt.xlabel("Time (Symbols)")
+
+    plt.ylabel("Amplitude")
+
+    plt.grid(True)
+
+    plt.tight_layout()
+
+    plt.show()
+
+    return traces
+
+
+# ============================================================
+# 3. BPSK SIGNAL GENERATION
+# ============================================================
+
+def generate_bpsk(num_symbols, sps):
+
+    bits = np.random.randint(0, 2, num_symbols)
+
+    symbols = 2 * bits - 1
+
+    upsampled = np.zeros(num_symbols * sps)
+
+    upsampled[::sps] = symbols
+
+    return bits, symbols, upsampled
+
+
+# ============================================================
+# 4. AWGN CHANNEL
+# ============================================================
+
+def add_awgn(signal, snr_db):
+
+    signal_power = np.mean(signal**2)
+
+    snr_linear = 10**(snr_db / 10)
+
+    noise_power = signal_power / snr_linear
+
+    noise = np.sqrt(noise_power) * np.random.randn(len(signal))
+
+    return signal + noise
+
+
+# ============================================================
+# 5. MATCHED FILTERING
+# ============================================================
+
+def matched_filter(signal, h):
+
+    return np.convolve(signal, h, mode='full')
+
+
+# ============================================================
+# 6. SYMBOL DETECTION AFTER DELAY REMOVAL
+# ============================================================
+
+def detect_symbols(filtered_signal, h_tx, h_rx,
+                   sps, num_symbols, timing_offset=0):
+
+    # Individual filter delays
+    delay_tx = (len(h_tx) - 1) // 2
+    delay_rx = (len(h_rx) - 1) // 2
+
+    # Total cascade delay
+    total_delay = delay_tx + delay_rx
+
+    # Remove total cascade delay
+    start = total_delay + timing_offset
+
+    # Sample only after delay removal
+    sample_indices = start + np.arange(num_symbols) * sps
+
+    valid = sample_indices < len(filtered_signal)
+
+    sample_indices = sample_indices[valid]
+
+    samples = filtered_signal[sample_indices]
+
+    detected_bits = (samples >= 0).astype(int)
+
+    return samples, detected_bits, total_delay
+
+
+# ============================================================
+# 7. EYE OPENING METRIC
+# ============================================================
+
+def calculate_eye_opening(filtered_signal, sps,
+                          total_delay, search_range=20):
+
+    """
+    Estimate eye opening for each sampling phase.
+
+    Sampling begins after total cascade delay.
+    """
+
+    phases = np.arange(-search_range, search_range + 1)
+
+    openings = []
+
+    for phase in phases:
+
+        start = total_delay + phase
+
+        samples = filtered_signal[start::sps]
+
+        samples = samples[:min(len(samples), 1000)]
+
+        if len(samples) > 20:
+
+            positive = samples[samples > 0]
+
+            negative = samples[samples < 0]
+
+            if len(positive) > 0 and len(negative) > 0:
+
+                opening = np.mean(positive) - np.mean(negative)
+
+            else:
+                opening = 0
+
+        else:
+            opening = 0
+
+        openings.append(opening)
+
+    best_index = np.argmax(openings)
+
+    best_phase = phases[best_index]
+
+    return phases, openings, best_phase
+
+
+# ============================================================
+# 8. MAIN SIMULATION
+# ============================================================
+
+np.random.seed(42)
+
+num_symbols = 3000
+
+sps = 8
+
+beta = 0.35
+
+span = 10
+
+snr_values = [0, 5, 10, 20]
+
+timing_offsets = [-2, -1, 0, 1, 2]
+
+
+# Generate RRC filters
+h_tx = rrc_filter(beta, span, sps)
+
+h_rx = h_tx.copy()
+
+
+# Confirm filter lengths and delays
+delay_tx = (len(h_tx) - 1) // 2
+
+delay_rx = (len(h_rx) - 1) // 2
+
+total_delay = delay_tx + delay_rx
+
+print("========== FILTER VALIDATION ==========")
+
+print("Samples per symbol:", sps)
+
+print("Filter span:", span)
+
+print("TX filter length:", len(h_tx))
+
+print("RX filter length:", len(h_rx))
+
+print("TX filter delay:", delay_tx)
+
+print("RX filter delay:", delay_rx)
+
+print("Total cascade delay:", total_delay)
+
+print("Expected total delay:",
+      span * sps)
+
+assert total_delay == span * sps
+
+print("Delay validation PASSED")
+
+
+# Generate BPSK
+bits, symbols, upsampled = generate_bpsk(num_symbols, sps)
+
+
+# Transmit filtering
+tx_signal = np.convolve(upsampled, h_tx, mode='full')
+
+
+# ============================================================
+# 9. SNR ANALYSIS
+# ============================================================
+
+for snr in snr_values:
+
+    # Add noise
+    noisy_signal = add_awgn(tx_signal, snr)
+
+    # Matched filtering
+    filtered_signal = matched_filter(noisy_signal, h_rx)
+
+    # Eye diagram after matched filtering
+    # Start near the cascade delay
+    eye_start = total_delay
+
+    eye_signal = filtered_signal[eye_start:]
+
+    print(f"\nGenerating eye diagram for SNR = {snr} dB")
+
+    eye_diagram(
+        eye_signal,
+        sps=sps,
+        samples_per_trace=2,
+        num_traces=100,
+        title=f"BPSK Eye Diagram After Matched Filtering (SNR={snr} dB)"
+    )
+
+
+# ============================================================
+# 10. TIMING OFFSET ANALYSIS
+# ============================================================
+
+snr = 10
+
+noisy_signal = add_awgn(tx_signal, snr)
+
+filtered_signal = matched_filter(noisy_signal, h_rx)
+
+
+print("\n========== TIMING OFFSET ANALYSIS ==========")
+
+for offset in timing_offsets:
+
+    samples, detected_bits, delay = detect_symbols(
+        filtered_signal,
+        h_tx,
+        h_rx,
+        sps,
+        num_symbols,
+        timing_offset=offset
+    )
+
+    valid_bits = bits[:len(detected_bits)]
+
+    ber = np.mean(detected_bits != valid_bits)
+
+    print(
+        f"Timing offset = {offset:+d} samples | "
+        f"Samples detected = {len(samples)} | "
+        f"BER = {ber:.6f}"
+    )
+
+
+# ============================================================
+# 11. OPTIMUM SAMPLING INSTANT
+# ============================================================
+
+phases, openings, best_phase = calculate_eye_opening(
+    filtered_signal,
+    sps,
+    total_delay,
+    search_range=3
+)
+
+print("\n========== OPTIMUM SAMPLING ==========")
+
+print("Total cascade delay:", total_delay)
+
+print("Optimum additional sampling phase:",
+      best_phase)
+
+print("Optimum sampling index:",
+      total_delay + best_phase)
+
+
+# Plot eye opening
+plt.figure(figsize=(8, 5))
+
+plt.plot(phases, openings, marker='o')
+
+plt.axvline(best_phase, linestyle='--',
+            label=f"Best phase = {best_phase}")
+
+plt.xlabel("Additional Timing Phase (Samples)")
+
+plt.ylabel("Estimated Eye Opening")
+
+plt.title("Sampling Phase Optimization")
+
+plt.grid(True)
+
+plt.legend()
+
+plt.tight_layout()
+
+plt.show()
+
+
+# ============================================================
+# 12. FINAL SYMBOL DETECTION
+# ============================================================
+
+samples, detected_bits, delay = detect_symbols(
+    filtered_signal,
+    h_tx,
+    h_rx,
+    sps,
+    num_symbols,
+    timing_offset=best_phase
+)
+
+valid_bits = bits[:len(detected_bits)]
+
+ber = np.mean(detected_bits != valid_bits)
+
+print("\n========== FINAL VALIDATION ==========")
+
+print("Total cascade delay:", delay)
+
+print("Additional optimum phase:", best_phase)
+
+print("First sample index:",
+      delay + best_phase)
+
+print("Detected symbols:", len(detected_bits))
+
+print("BER:", ber)
+
+print("Delay removal validation PASSED")
+
+assert delay + best_phase >= 0
+
+assert len(detected_bits) == len(samples)
+
+print("Symbol detection completed successfully.")
